@@ -1,6 +1,16 @@
 // Git smart HTTP: pkt-line codec, pack reader/writer (plain + deltas),
 // protocol v2 upload-pack (advertisement, ls-refs, fetch) and v0
 // receive-pack with per-ref fast-forward enforcement.
+//
+// v2 performance notes (behaviour unchanged from v1):
+// - pkt-line headers are decoded from raw bytes, no toString/parseInt.
+// - the v2 advertisement is one constant buffer; v0 advertisements,
+//   ls-refs and fetch responses are cached per repo and keyed by the
+//   store's stateVersion, so repeated identical requests (the clone
+//   workload's 50 concurrent depth-1 clones) reuse one built buffer.
+// - writePack deflates at level 1: any valid zlib stream is a legal
+//   pack, and level 1 is several times faster than the default.
+
 import { inflateSync, deflateSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import { Store, type Repo, type ObjType, ZERO, DEFAULT_BRANCH, parseCommit, parseTree, objId } from "./store.ts";
@@ -20,18 +30,46 @@ export const PKT_DELIM = Buffer.from("0001", "ascii");
 
 export type Packet = { kind: "data"; data: Buffer } | { kind: "flush" } | { kind: "delim" } | { kind: "end" };
 
+function hexVal(c: number): number {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10;
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10;
+  return -1;
+}
+
+/**
+ * One pkt-line header at buf[i]: -1 flush, -2 delim, -3 end, -4 invalid,
+ * otherwise the packet length (payload + 4).
+ */
+function headerAt(buf: Buffer, i: number): number {
+  const a = buf[i];
+  const b = buf[i + 1];
+  const c = buf[i + 2];
+  const d = buf[i + 3];
+  if (a === 0x30 && b === 0x30 && c === 0x30) {
+    if (d === 0x30) return -1;
+    if (d === 0x31) return -2;
+    if (d === 0x32) return -3;
+  }
+  const ha = hexVal(a);
+  const hb = hexVal(b);
+  const hc = hexVal(c);
+  const hd = hexVal(d);
+  if (ha < 0 || hb < 0 || hc < 0 || hd < 0) return -4;
+  return (ha << 12) | (hb << 8) | (hc << 4) | hd;
+}
+
 export function parsePktLines(buf: Buffer): { packets: Packet[]; rest: Buffer; error?: string } {
   const packets: Packet[] = [];
   let i = 0;
   while (i < buf.length) {
     if (i + 4 > buf.length) return { packets, rest: buf.subarray(i), error: "truncated pkt-line header" };
-    const hex = buf.subarray(i, i + 4).toString("ascii");
-    if (hex === "0000") { packets.push({ kind: "flush" }); i += 4; continue; }
-    if (hex === "0001") { packets.push({ kind: "delim" }); i += 4; continue; }
-    if (hex === "0002") { packets.push({ kind: "end" }); i += 4; continue; }
-    const len = parseInt(hex, 16);
-    if (Number.isNaN(len) || len < 4 || i + len > buf.length) {
-      return { packets, rest: buf.subarray(i), error: `bad pkt-line length ${JSON.stringify(hex)}` };
+    const len = headerAt(buf, i);
+    if (len === -1) { packets.push({ kind: "flush" }); i += 4; continue; }
+    if (len === -2) { packets.push({ kind: "delim" }); i += 4; continue; }
+    if (len === -3) { packets.push({ kind: "end" }); i += 4; continue; }
+    if (len === -4 || len < 4 || i + len > buf.length) {
+      return { packets, rest: buf.subarray(i), error: `bad pkt-line length ${JSON.stringify(buf.subarray(i, i + 4).toString("ascii"))}` };
     }
     packets.push({ kind: "data", data: buf.subarray(i + 4, i + len) });
     i += len;
@@ -47,16 +85,15 @@ export function parsePktLinesUntilFlush(buf: Buffer): { packets: Packet[]; rest:
   let i = 0;
   while (i < buf.length) {
     if (i + 4 > buf.length) return { packets, rest: buf.subarray(i), error: "truncated pkt-line header" };
-    const hex = buf.subarray(i, i + 4).toString("ascii");
-    if (hex === "0000") {
+    const len = headerAt(buf, i);
+    if (len === -1) {
       packets.push({ kind: "flush" });
       return { packets, rest: buf.subarray(i + 4) };
     }
-    if (hex === "0001") { packets.push({ kind: "delim" }); i += 4; continue; }
-    if (hex === "0002") { packets.push({ kind: "end" }); i += 4; continue; }
-    const len = parseInt(hex, 16);
-    if (Number.isNaN(len) || len < 4 || i + len > buf.length) {
-      return { packets, rest: buf.subarray(i), error: `bad pkt-line length ${JSON.stringify(hex)}` };
+    if (len === -2) { packets.push({ kind: "delim" }); i += 4; continue; }
+    if (len === -3) { packets.push({ kind: "end" }); i += 4; continue; }
+    if (len === -4 || len < 4 || i + len > buf.length) {
+      return { packets, rest: buf.subarray(i), error: `bad pkt-line length ${JSON.stringify(buf.subarray(i, i + 4).toString("ascii"))}` };
     }
     packets.push({ kind: "data", data: buf.subarray(i + 4, i + len) });
     i += len;
@@ -237,7 +274,9 @@ export function writePack(entries: { type: ObjType; data: Buffer }[]): Buffer {
       headerBytes.push(b);
     }
     parts.push(Buffer.from(headerBytes));
-    parts.push(deflateSync(e.data));
+    // Level 1: a pack only needs a valid zlib stream, and level 1
+    // compresses several times faster than the default level 6.
+    parts.push(deflateSync(e.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(requireSha1(body), "hex");
@@ -268,16 +307,16 @@ const V0_UPLOAD_CAPS =
 const V0_RECEIVE_CAPS =
   "report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=" + AGENT;
 
-export function v0UploadAdvertisement(repo: Repo): Buffer {
+function buildV0Advertisement(repo: Repo, service: string, caps: string): Buffer {
   const refs = refList(repo);
-  const items: (string | "flush")[] = ["# service=git-upload-pack\n"];
+  const items: (string | "flush")[] = [`# service=${service}\n`];
   if (refs.length === 0) {
-    items.push(`${ZERO} capabilities^{}\0${V0_UPLOAD_CAPS}\n`, "flush");
+    items.push(`${ZERO} capabilities^{}\0${caps}\n`, "flush");
     return pktLines(items);
   }
   const headRef = `refs/heads/${repo.defaultBranch}`;
   const headOid = repo.refs.get(headRef) ?? refs[0].oid;
-  items.push(`${headOid} HEAD\0${V0_UPLOAD_CAPS}\n`);
+  items.push(`${headOid} HEAD\0${caps}\n`);
   for (const r of refs) {
     items.push(`${r.oid} ${r.name}\n`);
     const peeled = tagTarget(repo, r.oid);
@@ -285,43 +324,45 @@ export function v0UploadAdvertisement(repo: Repo): Buffer {
   }
   items.push("flush");
   return pktLines(items);
+}
+
+export function v0UploadAdvertisement(repo: Repo): Buffer {
+  if (repo.uplAdv !== null && repo.uplAdvVersion === repo.stateVersion) return repo.uplAdv;
+  const buf = buildV0Advertisement(repo, "git-upload-pack", V0_UPLOAD_CAPS);
+  repo.uplAdv = buf;
+  repo.uplAdvVersion = repo.stateVersion;
+  return buf;
 }
 
 export function v0ReceiveAdvertisement(repo: Repo): Buffer {
-  const refs = refList(repo);
-  const items: (string | "flush")[] = ["# service=git-receive-pack\n"];
-  if (refs.length === 0) {
-    items.push(`${ZERO} capabilities^{}\0${V0_RECEIVE_CAPS}\n`, "flush");
-    return pktLines(items);
-  }
-  const headRef = `refs/heads/${repo.defaultBranch}`;
-  const headOid = repo.refs.get(headRef) ?? refs[0].oid;
-  items.push(`${headOid} HEAD\0${V0_RECEIVE_CAPS}\n`);
-  for (const r of refs) {
-    items.push(`${r.oid} ${r.name}\n`);
-    const peeled = tagTarget(repo, r.oid);
-    if (peeled) items.push(`${peeled} ${r.name}^{}\n`);
-  }
-  items.push("flush");
-  return pktLines(items);
+  if (repo.recvAdv !== null && repo.recvAdvVersion === repo.stateVersion) return repo.recvAdv;
+  const buf = buildV0Advertisement(repo, "git-receive-pack", V0_RECEIVE_CAPS);
+  repo.recvAdv = buf;
+  repo.recvAdvVersion = repo.stateVersion;
+  return buf;
 }
 
+const V2_ADVERTISEMENT: Buffer = pktLines([
+  "# service=git-upload-pack\n",
+  "flush",
+  "version 2\n",
+  `agent=${AGENT}\n`,
+  "ls-refs=unborn\n",
+  "fetch=shallow wait-for-done\n",
+  "object-format=sha1\n",
+  "flush",
+]);
+
 export function v2Advertisement(): Buffer {
-  return pktLines([
-    "# service=git-upload-pack\n",
-    "flush",
-    "version 2\n",
-    `agent=${AGENT}\n`,
-    "ls-refs=unborn\n",
-    "fetch=shallow wait-for-done\n",
-    "object-format=sha1\n",
-    "flush",
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // ---- ls-refs (v2) ----
 
 export function lsRefs(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }): Buffer {
+  const key = `${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(",")}`;
+  const hit = repo.lsCache.get(key);
+  if (hit && hit.version === repo.stateVersion) return hit.buf;
   const lines: string[] = [];
   const keep = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
@@ -343,7 +384,9 @@ export function lsRefs(repo: Repo, args: { peel: boolean; symrefs: boolean; unbo
     }
   }
   lines.push("flush");
-  return pktLines(lines as (string | "flush")[]);
+  const buf = pktLines(lines as (string | "flush")[]);
+  repo.lsCache.set(key, { version: repo.stateVersion, buf });
+  return buf;
 }
 
 // ---- fetch ----
@@ -494,7 +537,14 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return out;
 }
 
+function fetchCacheKey(version: 0 | 2, req: FetchRequest): string {
+  return `${version}|${req.wants.join(",")}|${req.haves.join(",")}|${req.depth ?? ""}|${req.oldShallow.join(",")}`;
+}
+
 export function fetchV2Response(store: Store, repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(2, req);
+  const hit = repo.fetchCache.get(key);
+  if (hit && hit.version === repo.stateVersion) return hit.buf;
   const sel = selectFetch(store, repo, req);
   const pack = writePack(sel.objects);
   const parts: Buffer[] = [];
@@ -514,10 +564,15 @@ export function fetchV2Response(store: Store, repo: Repo, req: FetchRequest): Bu
   parts.push(pktLine("packfile\n"));
   for (const p of sidebandPackets(pack)) parts.push(p);
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const buf = Buffer.concat(parts);
+  repo.fetchCache.set(key, { version: repo.stateVersion, buf });
+  return buf;
 }
 
 export function fetchV0Response(store: Store, repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(0, req);
+  const hit = repo.fetchCache.get(key);
+  if (hit && hit.version === repo.stateVersion) return hit.buf;
   const sel = selectFetch(store, repo, req);
   const pack = writePack(sel.objects);
   const parts: Buffer[] = [];
@@ -531,7 +586,9 @@ export function fetchV0Response(store: Store, repo: Repo, req: FetchRequest): Bu
   for (const u of sel.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
   for (const p of sidebandPackets(pack)) parts.push(p);
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const buf = Buffer.concat(parts);
+  repo.fetchCache.set(key, { version: repo.stateVersion, buf });
+  return buf;
 }
 
 // ---- receive-pack (v0) ----
@@ -576,7 +633,7 @@ export function receivePack(store: Store, repo: Repo, body: Buffer): PushResult 
     packObjects = read.objects;
   }
   for (const o of packObjects) {
-    if (!repo.objects.has(o.oid)) repo.objects.set(o.oid, { type: o.type, data: o.data });
+    store.putObject(repo, o.type, o.data, o.oid);
   }
   const report: { ref: string; ok: boolean; reason?: string }[] = [];
   for (const c of commands) {
@@ -601,8 +658,8 @@ export function receivePack(store: Store, repo: Repo, body: Buffer): PushResult 
       }
     }
     if (ok) {
-      if (c.newOid === ZERO) repo.refs.delete(c.ref);
-      else repo.refs.set(c.ref, c.newOid);
+      if (c.newOid === ZERO) store.deleteRef(repo, c.ref);
+      else store.setRef(repo, c.ref, c.newOid);
       report.push({ ref: c.ref, ok: true });
     } else {
       report.push({ ref: c.ref, ok: false, reason });

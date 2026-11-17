@@ -602,6 +602,7 @@ function resolveMutation(field: FieldSelection, ctx: GqlContext, doc: Document):
       return { __typename: "CreateIssuePayload", issue: null } as GqlObject;
     }
     const number = ++repo.counter;
+    const createdSeq = store.nextSeq();
     const issue: Issue = {
       number,
       title: String(input.title ?? ""),
@@ -609,7 +610,10 @@ function resolveMutation(field: FieldSelection, ctx: GqlContext, doc: Document):
       state: "open",
       labels: [],
       comments: [],
-      createdSeq: store.nextSeq(),
+      createdSeq,
+      createdAt: store.tsForSeq(createdSeq),
+      jsonCache: null,
+      jsonBase: null,
     };
     repo.issues.set(number, issue);
     return { __typename: "CreateIssuePayload", issue: issueObj(store, repo, issue) } as GqlObject;
@@ -623,6 +627,8 @@ function resolveMutation(field: FieldSelection, ctx: GqlContext, doc: Document):
       return { __typename: "CloseIssuePayload", issue: null } as GqlObject;
     }
     issue.state = "closed";
+    issue.jsonCache = null;
+    issue.jsonBase = null;
     return { __typename: "CloseIssuePayload", issue: issueObj(store, repo, issue) } as GqlObject;
   }
   if (field.name === "createPullRequest") {
@@ -697,6 +703,8 @@ function resolveMutation(field: FieldSelection, ctx: GqlContext, doc: Document):
     }
     const comment = { id: ++repo.commentId, body: String(input.body ?? "") };
     issue.comments.push(comment);
+    issue.jsonCache = null;
+    issue.jsonBase = null;
     return {
       __typename: "AddCommentPayload",
       commentEdge: {
@@ -713,7 +721,7 @@ function resolveMutation(field: FieldSelection, ctx: GqlContext, doc: Document):
 function mergePr(store: Store, repo: Repo, pr: PullRequest, headTip: string, baseTip: string): string {
   const headTree = parseCommit(repo.objects.get(headTip)!.data).tree;
   const mergeSha = store.makeCommit(repo, headTree, [baseTip], `Merge pull request #${pr.number} from ${pr.headRef}`);
-  repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+  store.setRef(repo, `refs/heads/${pr.baseRef}`, mergeSha);
   pr.state = "closed";
   pr.merged = true;
   pr.mergedAt = store.tick();

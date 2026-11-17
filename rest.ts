@@ -1,11 +1,23 @@
 // REST v3 handlers: repos, branches, refs, commits, contents, labels,
 // issues, comments, pull requests.
+//
+// v2 performance notes (behaviour unchanged from v1):
+// - a single issue's JSON is serialized once and cached on the issue
+//   (invalidated on any mutation); GET/POST/PATCH of one issue and the
+//   issue list serve the cached string without rebuilding or re-stringifying.
+// - timestamps come from the store's per-sequence cache, never a new Date.
+// - the JSON body parser does not trim (JSON.parse tolerates whitespace).
+// - ref mutations go through store.setRef/deleteRef so the git layer's
+//   cached advertisements and fetch responses stay correct.
+
 import { Store, type Repo, type Issue, type PullRequest, ZERO, DEFAULT_BRANCH, BASE_EPOCH, repoJson, parseCommit, parseTree } from "./store.ts";
 
 export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialized JSON body; when present the server sends it as-is. */
+  rawBody?: string;
 }
 
 export interface RestContext {
@@ -25,13 +37,14 @@ function err(status: number, message: string): RestResponse {
 const notFound = (what = "Not Found") => err(404, what);
 
 function parseJsonBody(ctx: RestContext): { value: Record<string, unknown> | null; error?: RestResponse } {
-  const text = ctx.body.toString("utf8").trim();
-  if (!text) return { value: {} };
+  if (ctx.body.length === 0) return { value: {} };
   try {
-    const v = JSON.parse(text);
+    const v = JSON.parse(ctx.body.toString("utf8"));
     if (v === null || typeof v !== "object" || Array.isArray(v)) return { value: null, error: err(400, "Invalid JSON body") };
     return { value: v as Record<string, unknown> };
   } catch {
+    // A whitespace-only body is an empty object, as before.
+    if (/^\s*$/.test(ctx.body.toString("utf8"))) return { value: {} };
     return { value: null, error: err(400, "Invalid JSON body") };
   }
 }
@@ -46,11 +59,31 @@ function issueJson(store: Store, repo: Repo, issue: Issue, baseUrl: string): Rec
     labels: issue.labels.map((name) => ({ name, color: repo.labels.get(name)?.color ?? "000000" })),
     user: { login: store.viewer.login, id: store.viewer.id, type: "User" },
     comments: issue.comments.length,
-    created_at: new Date((BASE_EPOCH + issue.createdSeq) * 1000).toISOString(),
-    updated_at: new Date((BASE_EPOCH + issue.createdSeq) * 1000).toISOString(),
+    created_at: issue.createdAt,
+    updated_at: issue.createdAt,
     html_url: `${baseUrl}/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `${baseUrl}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/** The issue's serialized REST JSON, cached on the issue until it mutates. */
+function issueJsonRaw(store: Store, repo: Repo, issue: Issue, baseUrl: string): string {
+  if (issue.jsonCache !== null && issue.jsonBase === baseUrl) return issue.jsonCache;
+  const raw = JSON.stringify(issueJson(store, repo, issue, baseUrl));
+  issue.jsonCache = raw;
+  issue.jsonBase = baseUrl;
+  return raw;
+}
+
+/** Drop an issue's cached JSON after any mutation of it. */
+function invalidateIssue(issue: Issue): void {
+  issue.jsonCache = null;
+  issue.jsonBase = null;
+}
+
+/** Drop every issue's cached JSON in a repo (a label's color may change). */
+function invalidateRepoIssues(repo: Repo): void {
+  for (const issue of repo.issues.values()) invalidateIssue(issue);
 }
 
 function prJson(store: Store, repo: Repo, pr: PullRequest, baseUrl: string): Record<string, unknown> {
@@ -67,8 +100,8 @@ function prJson(store: Store, repo: Repo, pr: PullRequest, baseUrl: string): Rec
     head: { ref: pr.headRef, sha: pr.headSha, label: `${repo.owner}:${pr.headRef}`, repo: { full_name: fullName } },
     base: { ref: pr.baseRef, sha: pr.baseSha, label: `${repo.owner}:${pr.baseRef}`, repo: { full_name: fullName } },
     user: { login: store.viewer.login, id: store.viewer.id, type: "User" },
-    created_at: new Date((BASE_EPOCH + pr.createdSeq) * 1000).toISOString(),
-    updated_at: new Date((BASE_EPOCH + pr.createdSeq) * 1000).toISOString(),
+    created_at: store.tsForSeq(pr.createdSeq),
+    updated_at: store.tsForSeq(pr.createdSeq),
     html_url: `${baseUrl}/${repo.owner}/${repo.name}/pull/${pr.number}`,
     url: `${baseUrl}/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
   };
@@ -246,7 +279,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       if (!ref.startsWith("refs/") || !/^[0-9a-f]{40}$/.test(sha)) return err(400, "ref and sha are required");
       if (!repo.objects.has(sha)) return err(422, "object does not exist");
       if (repo.refs.has(ref)) return err(422, "Reference already exists");
-      repo.refs.set(ref, sha);
+      store.setRef(repo, ref, sha);
       return ok({ ref, object: { sha }, url: `${baseUrl}/api/v3/repos/${owner}/${repoName}/git/refs/${ref.replace("refs/", "")}` }, 201);
     }
     if (method === "GET" && rest.length >= 3) {
@@ -351,7 +384,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
         else {
           const base = branchTip(repo, repo.defaultBranch);
           if (!base) return notFound("branch does not exist");
-          repo.refs.set(`refs/heads/${branch}`, base);
+          store.setRef(repo, `refs/heads/${branch}`, base);
           tip = base;
         }
       }
@@ -367,7 +400,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       const baseTree = tip ? parseCommit(repo.objects.get(tip)!.data).tree : store.buildTree(repo, []);
       const newTree = store.updateTreePath(repo, baseTree, path.split("/"), blobOid);
       const commitOid = store.makeCommit(repo, newTree, tip ? [tip] : [], message);
-      repo.refs.set(`refs/heads/${branch}`, commitOid);
+      store.setRef(repo, `refs/heads/${branch}`, commitOid);
       return ok({
         content: { name: path.split("/").pop(), path, sha: blobOid, size: content.length, encoding: "base64", type: "file" },
         commit: { sha: commitOid, message },
@@ -388,7 +421,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       const baseTree = parseCommit(repo.objects.get(tip)!.data).tree;
       const newTree = store.updateTreePath(repo, baseTree, path.split("/"), null);
       const commitOid = store.makeCommit(repo, newTree, [tip], message);
-      repo.refs.set(`refs/heads/${branch}`, commitOid);
+      store.setRef(repo, `refs/heads/${branch}`, commitOid);
       return ok({ commit: { sha: commitOid, message } });
     }
     return notFound();
@@ -406,6 +439,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       if (!name) return err(400, "name is required");
       const color = typeof value!.color === "string" ? value!.color : "000000";
       repo.labels.set(name, { name, color });
+      invalidateRepoIssues(repo);
       return ok({ name, color, description: "" }, 201);
     }
     return notFound();
@@ -419,7 +453,9 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       let list = [...repo.issues.values()];
       if (state !== "all") list = list.filter((i) => i.state === state);
       list.sort((a, b) => (direction === "asc" ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
-      return ok(list.map((i) => issueJson(store, repo, i, baseUrl)));
+      const { page, headers } = paginate(list, query, baseUrl, `/api/v3/repos/${owner}/${repoName}/issues`);
+      const raw = `[${page.map((i) => issueJsonRaw(store, repo, i, baseUrl)).join(",")}]`;
+      return { status: 200, body: null, headers, rawBody: raw };
     }
     if (rest.length === 1 && method === "POST") {
       const { value, error } = parseJsonBody(ctx);
@@ -431,6 +467,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
         if (!repo.labels.has(l)) return err(422, `label "${l}" does not exist`);
       }
       const number = ++repo.counter;
+      const createdSeq = store.nextSeq();
       const issue: Issue = {
         number,
         title,
@@ -438,17 +475,20 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
         state: "open",
         labels,
         comments: [],
-        createdSeq: store.nextSeq(),
+        createdSeq,
+        createdAt: store.tsForSeq(createdSeq),
+        jsonCache: null,
+        jsonBase: null,
       };
       repo.issues.set(number, issue);
-      return ok(issueJson(store, repo, issue, baseUrl), 201);
+      return { status: 201, body: null, rawBody: issueJsonRaw(store, repo, issue, baseUrl) };
     }
     const num = parseInt(rest[1] ?? "", 10);
     if (Number.isNaN(num)) return notFound();
     if (rest.length === 2 && method === "GET") {
       const issue = repo.issues.get(num);
       if (!issue) return notFound();
-      return ok(issueJson(store, repo, issue, baseUrl));
+      return { status: 200, body: null, rawBody: issueJsonRaw(store, repo, issue, baseUrl) };
     }
     if (rest.length === 2 && method === "PATCH") {
       const issue = repo.issues.get(num);
@@ -463,7 +503,8 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
         for (const l of labels) if (!repo.labels.has(l)) return err(422, `label "${l}" does not exist`);
         issue.labels = labels;
       }
-      return ok(issueJson(store, repo, issue, baseUrl));
+      invalidateIssue(issue);
+      return { status: 200, body: null, rawBody: issueJsonRaw(store, repo, issue, baseUrl) };
     }
     if (rest.length === 3 && rest[2] === "comments") {
       const issue = repo.issues.get(num);
@@ -482,6 +523,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
         if (!body) return err(400, "body is required");
         const comment = { id: ++repo.commentId, body };
         issue.comments.push(comment);
+        invalidateIssue(issue);
         return ok({
           id: comment.id, body,
           user: { login: store.viewer.login, id: store.viewer.id },
@@ -570,7 +612,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResponse {
       if (store.hasConflict(repo, fresh)) return err(405, "merge conflict");
       const headTree = parseCommit(repo.objects.get(headTip)!.data).tree;
       const mergeSha = store.makeCommit(repo, headTree, [baseTip], `Merge pull request #${num} from ${pr.headRef}`);
-      repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+      store.setRef(repo, `refs/heads/${pr.baseRef}`, mergeSha);
       pr.state = "closed";
       pr.merged = true;
       pr.mergedAt = store.tick();

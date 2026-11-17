@@ -217,7 +217,7 @@ function doMerge(store: Store, repo: Repo, pr: PullRequest): { ok: boolean; sha?
   if (store.hasConflict(repo, fresh)) return { ok: false, reason: "merge conflict" };
   const headTree = parseCommit(repo.objects.get(headTip)!.data).tree;
   const mergeSha = store.makeCommit(repo, headTree, [baseTip], `Merge pull request #${pr.number} from ${pr.headRef}`);
-  repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+  store.setRef(repo, `refs/heads/${pr.baseRef}`, mergeSha);
   pr.state = "closed";
   pr.merged = true;
   pr.mergedAt = store.tick();
@@ -262,6 +262,7 @@ function callTool(store: Store, baseUrl: string, id: unknown, name: string, rawA
         : [];
       for (const l of labels) if (!repo.labels.has(l)) return toolResult(id, `label "${l}" does not exist`, true);
       const number = ++repo.counter;
+      const createdSeq = store.nextSeq();
       const issue: Issue = {
         number,
         title: String(args.title),
@@ -269,7 +270,10 @@ function callTool(store: Store, baseUrl: string, id: unknown, name: string, rawA
         state: "open",
         labels,
         comments: [],
-        createdSeq: store.nextSeq(),
+        createdSeq,
+        createdAt: store.tsForSeq(createdSeq),
+        jsonCache: null,
+        jsonBase: null,
       };
       repo.issues.set(number, issue);
       return toolResult(id, issueJson(store, repo, issue));
@@ -286,7 +290,7 @@ function callTool(store: Store, baseUrl: string, id: unknown, name: string, rawA
     }
     case "get_issue": {
       const repo = getRepo();
-      if (!repo) return toolResult(id, "repository not found", true);
+      if (!repo) return toolResult(id, "issue not found", true);
       const issue = repo.issues.get(Number(args.issue_number));
       if (!issue) return toolResult(id, "issue not found", true);
       return toolResult(id, issueJson(store, repo, issue));

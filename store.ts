@@ -1,6 +1,17 @@
 // In-memory store for the forge: repos, git objects, refs, issues, PRs.
 // All timestamps are deterministic (sequence counter), never wall clock,
 // so a replay of the same trial produces the same state export.
+//
+// v2 performance notes (behaviour unchanged from v1):
+// - objId hashes header and data with two updates instead of Buffer.concat.
+// - commitParents scans only the header's parent lines, no full parse.
+// - isAncestor walks parents with an early exit and reuses cached ancestor
+//   sets instead of rebuilding a full set for every new tip.
+// - timestamp strings are cached per sequence number.
+// - every ref/object mutation bumps repo.stateVersion, which the git layer
+//   uses to key its cached advertisements and fetch responses.
+// - each issue caches its serialized REST JSON, invalidated on mutation.
+
 import { createHash } from "node:crypto";
 
 export const ZERO = "0".repeat(40);
@@ -12,7 +23,8 @@ export function sha1(buf: Buffer): string {
 
 export function objId(type: string, data: Buffer): string {
   const head = Buffer.from(`${type} ${data.length}\0`, "utf8");
-  return sha1(Buffer.concat([head, data]));
+  // Two updates: no copy of the (possibly large) data buffer.
+  return createHash("sha1").update(head).update(data).digest("hex");
 }
 
 export type ObjType = "commit" | "tree" | "blob" | "tag";
@@ -42,6 +54,33 @@ export function parseCommit(data: Buffer): CommitInfo {
     else if (line.startsWith("committer ")) info.committer = line.slice(10);
   }
   return info;
+}
+
+/** Only the parent oids of a commit buffer, scanned line by line. */
+export function parentOids(data: Buffer): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    const nl = data.indexOf(0x0a, i);
+    const end = nl < 0 ? data.length : nl;
+    const len = end - i;
+    if (len === 0) break; // blank line ends the header
+    if (
+      len > 7 &&
+      data[i] === 0x70 && // p
+      data[i + 1] === 0x61 && // a
+      data[i + 2] === 0x72 && // r
+      data[i + 3] === 0x65 && // e
+      data[i + 4] === 0x6e && // n
+      data[i + 5] === 0x74 && // t
+      data[i + 6] === 0x20
+    ) {
+      out.push(data.subarray(i + 7, end).toString("ascii"));
+    }
+    if (nl < 0) break;
+    i = nl + 1;
+  }
+  return out;
 }
 
 export interface TreeEntry {
@@ -90,6 +129,12 @@ export interface Issue {
   labels: string[];
   comments: { id: number; body: string }[];
   createdSeq: number;
+  /** ISO timestamp string for createdSeq, computed once at creation. */
+  createdAt: string;
+  /** Cached JSON.stringify of the REST issue object; null when stale. */
+  jsonCache: string | null;
+  /** The baseUrl the cached JSON was built with. */
+  jsonBase: string | null;
 }
 
 export interface PullRequest {
@@ -116,6 +161,8 @@ export interface Repo {
   priv: boolean;
   defaultBranch: string;
   createdSeq: number;
+  /** ISO timestamp string for createdSeq, computed once at creation. */
+  createdAt: string;
   refs: Map<string, string>; // refname -> oid
   objects: Map<string, GitObject>;
   issues: Map<number, Issue>;
@@ -126,6 +173,18 @@ export interface Repo {
   shallow: Set<string>; // shallow boundary commit oids (per repo, v2 fetch)
   ancCache: Map<string, Set<string>>; // commit oid -> ancestors incl. self
   treeCache: Map<string, Map<string, { oid: string; mode: string }>>; // commit oid -> flat path map
+  /** Bumped on every ref or object mutation; keys the git response caches. */
+  stateVersion: number;
+  /** Cached v0 upload-pack advertisement for the current stateVersion. */
+  uplAdv: Buffer | null;
+  uplAdvVersion: number;
+  /** Cached v0 receive-pack advertisement for the current stateVersion. */
+  recvAdv: Buffer | null;
+  recvAdvVersion: number;
+  /** Cached ls-refs responses, keyed by the argument signature. */
+  lsCache: Map<string, { version: number; buf: Buffer }>;
+  /** Cached fetch responses, keyed by the request signature. */
+  fetchCache: Map<string, { version: number; buf: Buffer }>;
 }
 
 export interface Viewer {
@@ -149,13 +208,25 @@ export class Store {
   private seq = 0;
   private nextRepoId = 5000;
   repos = new Map<string, Repo>(); // keyed by repo name
+  /** Deterministic timestamp strings, one per sequence number. */
+  private tsCache = new Map<number, string>();
 
   nextSeq(): number {
     return ++this.seq;
   }
 
+  /** ISO timestamp for a sequence number (cached: the string never changes). */
+  tsForSeq(seq: number): string {
+    let s = this.tsCache.get(seq);
+    if (s === undefined) {
+      s = new Date((BASE_EPOCH + seq) * 1000).toISOString();
+      this.tsCache.set(seq, s);
+    }
+    return s;
+  }
+
   timestamp(): string {
-    return new Date((BASE_EPOCH + this.seq) * 1000).toISOString();
+    return this.tsForSeq(this.seq);
   }
 
   tick(): string {
@@ -197,6 +268,7 @@ export class Store {
   }
 
   createRepo(name: string, priv: boolean, description: string): Repo {
+    const createdSeq = this.nextSeq();
     const r: Repo = {
       id: this.nextRepoId++,
       name,
@@ -204,7 +276,8 @@ export class Store {
       description,
       priv,
       defaultBranch: DEFAULT_BRANCH,
-      createdSeq: this.nextSeq(),
+      createdSeq,
+      createdAt: this.tsForSeq(createdSeq),
       refs: new Map(),
       objects: new Map(),
       issues: new Map(),
@@ -215,6 +288,13 @@ export class Store {
       shallow: new Set(),
       ancCache: new Map(),
       treeCache: new Map(),
+      stateVersion: 0,
+      uplAdv: null,
+      uplAdvVersion: -1,
+      recvAdv: null,
+      recvAdvVersion: -1,
+      lsCache: new Map(),
+      fetchCache: new Map(),
     };
     // Seed the six scenario labels so issues may carry them.
     for (const label of ["bug", "enhancement", "documentation", "question", "good first issue", "help wanted"]) {
@@ -224,12 +304,35 @@ export class Store {
     return r;
   }
 
+  // ---- refs (centralized so the version counter stays correct) ----
+
+  setRef(repo: Repo, ref: string, oid: string): void {
+    repo.refs.set(ref, oid);
+    repo.stateVersion++;
+  }
+
+  deleteRef(repo: Repo, ref: string): void {
+    repo.refs.delete(ref);
+    repo.stateVersion++;
+  }
+
   // ---- git objects ----
 
   addObject(repo: Repo, type: ObjType, data: Buffer): string {
     const id = objId(type, data);
-    if (!repo.objects.has(id)) repo.objects.set(id, { type, data });
+    if (!repo.objects.has(id)) {
+      repo.objects.set(id, { type, data });
+      repo.stateVersion++;
+    }
     return id;
+  }
+
+  /** Store an already-hashed pack object; bumps the version only when new. */
+  putObject(repo: Repo, type: ObjType, data: Buffer, oid: string): void {
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.stateVersion++;
+    }
   }
 
   getObject(repo: Repo, oid: string): GitObject | undefined {
@@ -293,7 +396,7 @@ export class Store {
         entries.push({ mode: "100644", name: head, oid: blobOid });
       }
     } else {
-      let childOid = idx >= 0 && entries[idx].mode === "40000" ? entries[idx].oid : null;
+      const childOid = idx >= 0 && entries[idx].mode === "40000" ? entries[idx].oid : null;
       const empty = this.buildTree(repo, []);
       const next = this.updateTreePath(repo, childOid ?? empty, rest, blobOid);
       if (idx >= 0) entries[idx] = { mode: "40000", name: head, oid: next };
@@ -307,7 +410,7 @@ export class Store {
   commitParents(repo: Repo, oid: string): string[] {
     const obj = repo.objects.get(oid);
     if (!obj || obj.type !== "commit") return [];
-    return parseCommit(obj.data).parents;
+    return parentOids(obj.data);
   }
 
   ancestors(repo: Repo, oid: string): Set<string> {
@@ -330,9 +433,29 @@ export class Store {
     return out;
   }
 
+  /**
+   * True when anc is an ancestor of desc (or equal). Unlike ancestors(),
+   * this stops the moment anc is found and never builds a full set: a
+   * sequential push chain resolves in a single parent step, where the
+   * full-set walk would copy the whole history on every push.
+   */
   isAncestor(repo: Repo, anc: string, desc: string): boolean {
     if (anc === desc) return true;
-    return this.ancestors(repo, desc).has(anc);
+    const seen = new Set<string>();
+    const stack = [desc];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      if (cur === anc) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      const hit = repo.ancCache.get(cur);
+      if (hit) {
+        if (hit.has(anc)) return true;
+        continue; // the cached set is complete: nothing below cur helps
+      }
+      for (const p of this.commitParents(repo, cur)) stack.push(p);
+    }
+    return false;
   }
 
   // First common ancestor of a and b, walking a's history newest-first.
@@ -471,8 +594,8 @@ export function repoJson(store: Store, r: Repo, baseUrl: string): Record<string,
     default_branch: r.defaultBranch,
     html_url: `${baseUrl}/${r.owner}/${r.name}`,
     url: `${baseUrl}/api/v3/repos/${r.owner}/${r.name}`,
-    created_at: new Date((BASE_EPOCH + r.createdSeq) * 1000).toISOString(),
-    updated_at: new Date((BASE_EPOCH + r.createdSeq) * 1000).toISOString(),
+    created_at: r.createdAt,
+    updated_at: r.createdAt,
     has_issues: true,
     has_projects: false,
     has_wiki: false,
